@@ -1,0 +1,132 @@
+---
+title: "Species-specific Refugia Index"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+This code can be used to generate climate-change refugia indices for individual species based on species distribution model predictions. First install and load the required packages:
+
+```{required packages}
+library(raster) #raster manipulation
+library(rgdal) #spatial data library
+library(yaImpute) # for ann function
+library(gdata) # for nobs function
+```
+
+Next, define paths, set the working directory, and obtain a list of species with SDMs:
+
+```{path definitions}
+#ref = output directory
+#species = SDM directory
+#ecor = study area extent raster
+#sample = sample SDM raster
+
+setwd(species)
+spec <- list.dirs(species)
+sample <- sample*0 + 1
+```
+
+A key component of the index is a distance-decay function based on a fat-tailed dispersal kernel, which accommodates rare long-distance dispersal events, and has been invoked to explain the rapid post-glacial recolonization of trees across northern North America (Clark et al. 1998). The following two functions are used to calculate (1) an individual probability value [ranging from 0 to 1] from a negative exponential distribution for a given distance (x), alpha, and shape (c); and (2) the mean dispersal distance for a given alpha and c. For a fat-tailed distribution, c = 0.5. 
+
+```{negative exponential distribution}
+fattail <- function(x, alpha, c) {
+	left <- (c/(2*alpha*gamma(1/c)))
+	right <- exp(-1*((abs(x/alpha))^c))
+	result <- left*right
+	return(right)
+}
+
+ftmean <- function(alpha, c) {
+		result <-(alpha*gamma(2/c))/gamma(1/c)
+		return(result)
+		}
+```
+
+The following code loops through species, calculates study area prevalence (mean probability of occurrence), writes those values to a data frame, and then generates binary presence/absence rasters for current and future time periods using prevalence as a probability threshold:
+``` {prevalence calculation}
+prevtab <- data.frame("spec" = gsub(paste(species,"/",sep=""),"",spec), "prev" = 0)
+for (i in 2:length(spec)){
+  velstack<-emptystack
+  p <- list.files(spec[i],pattern="current.tif$")
+  pres <- raster(paste(spec[i],"\\",p,sep=""))
+  presc <- crop(pres,ecor)
+  prescm <- mask(presc,ecor)
+  prev <- cellStats(prescm,'mean')
+  prevtab[i,2] <- prev
+  present<-as.data.frame(rasterToPoints(prescm))
+  names(present)[3] <- "prob"
+  presprev <- prescm
+  values(presprev) <- ifelse(values(presprev) > prev, 1, 0) 
+  writeRaster(presprev,filename=paste(spec[i],"presprev",sep=""),format="GTiff", overwrite=TRUE)
+  f <- list.files(spec[i],pattern="future.tif$")
+  for (j in 1:4) {
+    fut <- raster(paste(spec[i],"/",f[j],sep=""))
+    futc <- crop(fut,ecor)
+    futcm <- mask(futc,ecor)
+    future<-as.data.frame(rasterToPoints(futcm))
+    names(future)[3] <- "prob"	
+    futprev <- futcm
+    values(futprev) <- ifelse(values(futprev) > prev, 1, 0) 
+    writeRaster(futprev,filename=paste(gsub(paste(species,"/",sep=""),"",f[j]),"futprev",sep=""),format="GTiff", overwrite=TRUE)
+  }
+}
+
+```
+The final bit of code calculates biotic velocity (Carroll et al. 2015) for each species based on the nearest-analog velocity algorithm defined by Hamann et al. (2015), and then applies the distance-decay function to obtain an index ranging from 0 to 1. For a fat-tailed distribution, c = 0.5, and alpha = 8333.33 results in a mean migration rate of 500 m/year (50 km/century). Velocity values are averaged over four GCMs, with NA values first converted to zeros. 
+
+``` {velocity-based refugia metric calculation}
+emptystack<-sample
+emptystack<-addLayer(emptystack,emptystack)
+emptystack<-dropLayer(emptystack,c(1,2))
+for (i in 2:length(spec)){
+  refstack<-emptystack
+  futprevstack<-emptystack
+  p <- list.files(spec[i],pattern="presprev.tif$")
+  presprev <- raster(paste(spec[i],"//",p,sep=""))
+  present<-as.data.frame(rasterToPoints(presprev))
+  names(present)[3] <- "prev"
+  f <- list.files(spec[i],pattern="futprev.tif")
+  for (j in 1:4) {
+    futprev <- raster(paste(spec[i],"\\",f[j],sep=""))
+    future <- as.data.frame(rasterToPoints(futprev))
+    names(future)[3] <- "prev"	
+    p.xy<-cbind(seq(1,length(present$x),1),present$x,present$y,present$prev)
+    f.xy<-cbind(seq(1,length(future$x),1),future$x,future$y,future$prev)
+    p.xy2<-p.xy[p.xy[,4]>0.1,1:3,drop=FALSE]
+    f.xy2<-f.xy[f.xy[,4]>0.1,1:3,drop=FALSE]
+    if(nrow(f.xy)>0){
+      d.ann <- as.data.frame(ann(
+        as.matrix(p.xy2[,-1,drop=FALSE]),
+        as.matrix(f.xy2[,-1,drop=FALSE]),
+        k=1, verbose=F)$knnIndexDist)
+      d1b <- as.data.frame(cbind(f.xy2, round(sqrt(d.ann[,2]))))
+      names(d1b) <- c("ID","X","Y","bvel")
+    } else {
+      print(spec[i])
+    }
+    f.xy <- as.data.frame(f.xy)
+    names(f.xy) <- c("ID","X","Y","Pres")
+    d1b<-merge(f.xy,d1b,by=c("ID","X","Y"),all.x=TRUE)
+    d1b$fat <- fattail(d1b$bvel, 8333.3335, 0.5) 
+    sppref<-rasterFromXYZ(d1b[,c(2,3,6)])
+    sppref[is.na(sppref[])] <- 0
+    refstack<-addLayer(refstack,sppref)
+    futprevstack<-addLayer(futprevstack,futprev)
+  }
+  futprevmean <- overlay(futprevstack, fun='mean')
+  writeRaster(futprevmean,filename=paste(gsub(paste(species,"/",sep=""),"",spec[i]),"futprev",sep=""),format="GTiff",overwrite=TRUE)
+  refmean <- overlay(refstack, fun='mean')
+  writeRaster(refmean,filename=paste(ref,gsub(paste(species,"/",sep=""),"",spec[i]),"refugia",sep=""),format="GTiff",overwrite=TRUE)
+}
+```
+
+References
+
+Carroll, C., J. J. Lawler, D. R. Roberts, and A. Hamann. 2015. Biotic and climatic velocity identify contrasting areas of vulnerability to climate change. PLoS ONE 10:e0140486.
+
+Clark, J. S., C. Fastie, G. Hurtt, S. T. Jackson, C. Johnson, G. A. King, M. Lewis, J. Lynch, S. Pacala, C. Prentice, E. W. Schupp, I. I. I. T. Webb, and P. Wyckoff. 1998. Reid's Paradox of Rapid Plant MigrationDispersal theory and interpretation of paleoecological records. BioScience 48:13-24.
+
+Hamann, A., D. Roberts, Q. Barber, C. Carroll, and S. Nielsen. 2015. Velocity of climate change algorithms for guiding conservation and management. Global Change Biology 21:997-1004.
